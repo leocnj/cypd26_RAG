@@ -1,0 +1,6 @@
+ray[data]==2.54.0
+s3fs
+pyarrow
+fsspec
+botocore
+pandas
