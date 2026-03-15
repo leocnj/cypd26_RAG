@@ -1,22 +1,29 @@
 import logging
 import os
+import sys
+
+# CRITICAL: Early logging to catch import errors
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+logger.info("Container starting up. Python version: %s", sys.version)
+
+import threading
 from contextlib import asynccontextmanager
 from typing import Any, List, Optional
 
-import chromadb
-from chromadb.utils import embedding_functions
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+try:
+    import chromadb
+    from chromadb.utils import embedding_functions
+    from fastapi import FastAPI, HTTPException, BackgroundTasks
+    from pydantic import BaseModel
+    import requests
+    from dotenv import load_dotenv
+    logger.info("Successfully imported core dependencies.")
+except Exception as e:
+    logger.error("Failed to import dependencies: %s", str(e))
+    raise e
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Global variables for shared resources
+# Global variables
 models = {}
 
 class QueryRequest(BaseModel):
@@ -29,66 +36,65 @@ class QueryResponse(BaseModel):
     provider: str
 
 def bootstrap_efs_from_s3():
-    """Download ChromaDB from S3 if the EFS mount is empty."""
+    """Background task to sync data from S3."""
     s3_bucket = os.environ.get("MIGRATION_S3_BUCKET")
     s3_prefix = os.environ.get("MIGRATION_S3_PREFIX", "migration/cyp2d6_knowledge_base")
-    chroma_path = os.environ.get("CHROMA_PATH", "./chroma_db")
+    chroma_path = os.environ.get("CHROMA_PATH", "/app/chroma_db")
 
     if not s3_bucket:
         logger.info("No MIGRATION_S3_BUCKET set. Skipping bootstrap.")
         return
 
-    # Check if directory is empty (usually it will contain at least a 'chroma.sqlite3' if initialized)
+    logger.info(f"Background Sync: Checking {chroma_path} for data...")
     is_empty = not os.path.exists(chroma_path) or not os.listdir(chroma_path)
     
     if is_empty:
-        logger.info(f"EFS mount {chroma_path} is empty. Bootstrapping from s3://{s3_bucket}/{s3_prefix}...")
+        logger.info(f"Syncing from s3://{s3_bucket}/{s3_prefix}...")
         try:
             import subprocess
-            # Ensure the directory exists
             os.makedirs(chroma_path, exist_ok=True)
-            # Use AWS CLI (pre-installed in Docker) to sync
             cmd = ["aws", "s3", "sync", f"s3://{s3_bucket}/{s3_prefix}", chroma_path]
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode == 0:
-                logger.info("EFS Bootstrap successful.")
+                logger.info("S3 Sync successful.")
+                # After sync, reload the collection count
+                try:
+                    chroma_client = chromadb.PersistentClient(path=chroma_path)
+                    collection = chroma_client.get_collection(name="cyp2d6_knowledge_base")
+                    models["collection"] = collection
+                    models["count"] = collection.count()
+                    logger.info(f"Refreshed VectorDB with {models['count']} records.")
+                except:
+                    pass
             else:
-                logger.error(f"EFS Bootstrap failed: {result.stderr}")
+                logger.error(f"S3 Sync failed: {result.stderr}")
         except Exception as e:
-            logger.error(f"Error during EFS Bootstrap: {str(e)}")
+            logger.error(f"Error during S3 Sync: {str(e)}")
     else:
-        logger.info(f"EFS mount {chroma_path} already contains data. Skipping bootstrap.")
+        logger.info(f"Data already present at {chroma_path}.")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load environment variables
     load_dotenv()
     
-    # 1. Bootstrap data from S3 to EFS if needed
-    bootstrap_efs_from_s3()
+    # 1. Start S3 sync in a SEPARATE THREAD so it doesn't block startup
+    threading.Thread(target=bootstrap_efs_from_s3, daemon=True).start()
     
-    # 2. Initialize ChromaDB
-    chroma_path = os.environ.get("CHROMA_PATH", "./chroma_db")
-    logger.info(f"Connecting to ChromaDB at: {chroma_path}")
-    
-    try:
-        chroma_client = chromadb.PersistentClient(path=chroma_path)
-        model_name = "all-MiniLM-L6-v2"
-        emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=model_name
-        )
-        collection = chroma_client.get_collection(
-            name="cyp2d6_knowledge_base", embedding_function=emb_fn
-        )
-        models["collection"] = collection
-        models["count"] = collection.count()
-        logger.info(f"Loaded RAG VectorDB with {models['count']} child chunk embeddings.")
-    except Exception as e:
-        logger.error(f"Failed to initialize ChromaDB: {str(e)}")
-        raise e
+    # 2. Try to initialize existing ChromaDB (if any)
+    chroma_path = os.environ.get("CHROMA_PATH", "/app/chroma_db")
+    if os.path.exists(chroma_path) and os.listdir(chroma_path):
+        try:
+            chroma_client = chromadb.PersistentClient(path=chroma_path)
+            model_name = "all-MiniLM-L6-v2"
+            emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name)
+            collection = chroma_client.get_collection(name="cyp2d6_knowledge_base", embedding_function=emb_fn)
+            models["collection"] = collection
+            models["count"] = collection.count()
+            logger.info(f"Initialized with existing data: {models['count']} records.")
+        except Exception as e:
+            logger.warning(f"Initial DB connect failed (might still be syncing): {e}")
 
     yield
-    # Clean up if needed
     models.clear()
 
 app = FastAPI(title="CYP2D6 RAG API", lifespan=lifespan)
@@ -145,8 +151,9 @@ Answer:"""
 
         if provider == "gemini":
             gemini_model = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+            api_version = os.environ.get("GEMINI_API_VERSION", "v1beta")
             url = (
-                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"https://generativelanguage.googleapis.com/{api_version}/models/"
                 f"{gemini_model}:generateContent?key={api_key}"
             )
             headers = {"Content-Type": "application/json"}
