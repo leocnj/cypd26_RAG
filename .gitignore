@@ -6,6 +6,7 @@ venv/
 *.tfstate
 *.tfstate.*
 .terraform.lock.hcl
+*.tfvars
 che__/
 *.pyc
 
