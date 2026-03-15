@@ -1,7 +1,12 @@
 # Environments
 venv/
 .env
-__pycache__/
+.chroma/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+che__/
 *.pyc
 
 # Data (Reproducible via scripts 01 & 02)
