@@ -1,4 +1,5 @@
 import React from 'react';
+import PropTypes from 'prop-types';
 import './CitationCard.css';
 
 const CitationCard = ({ citation }) => {
@@ -13,13 +14,8 @@ const CitationCard = ({ citation }) => {
     }
   }
 
-  return (
-    <a
-      href={url}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="citation-card"
-    >
+  const innerContent = (
+    <>
       <div className="citation-header">
         <span className="drug-id">{citation.drug_id || 'Unknown'}</span>
         {citation.name && <span className="drug-name"> - {citation.name}</span>}
@@ -29,8 +25,31 @@ const CitationCard = ({ citation }) => {
           <small className="smiles-text">SMILES: {citation.smiles}</small>
         </div>
       )}
-    </a>
+    </>
   );
+
+  return citation.drug_id ? (
+    <a
+      href={url}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="citation-card"
+    >
+      {innerContent}
+    </a>
+  ) : (
+    <div className="citation-card">
+      {innerContent}
+    </div>
+  );
+};
+
+CitationCard.propTypes = {
+  citation: PropTypes.shape({
+    drug_id: PropTypes.string,
+    name: PropTypes.string,
+    smiles: PropTypes.string
+  })
 };
 
 export default CitationCard;

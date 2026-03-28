@@ -1,4 +1,5 @@
 import React from 'react';
+import PropTypes from 'prop-types';
 import CitationCard from './CitationCard';
 import './Message.css';
 
@@ -12,9 +13,7 @@ const Message = ({ message }) => {
         {!isUser && is_substrate && (
           <div className="message-status">
             <span className={`badge badge-${is_substrate.toLowerCase()}`}>
-              {is_substrate === 'Substrate' ? 'Substrate' : 
-               is_substrate === 'Non-substrate' ? 'Non-substrate' : 
-               is_substrate === 'Inhibitor' ? 'Inhibitor' : is_substrate}
+              {is_substrate}
             </span>
           </div>
         )}
@@ -30,6 +29,21 @@ const Message = ({ message }) => {
       </div>
     </div>
   );
+};
+
+Message.propTypes = {
+  message: PropTypes.shape({
+    role: PropTypes.string.isRequired,
+    content: PropTypes.string.isRequired,
+    citations: PropTypes.arrayOf(
+      PropTypes.shape({
+        drug_id: PropTypes.string,
+        name: PropTypes.string,
+        smiles: PropTypes.string
+      })
+    ),
+    is_substrate: PropTypes.string
+  }).isRequired
 };
 
 export default Message;
