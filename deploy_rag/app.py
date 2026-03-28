@@ -30,10 +30,17 @@ class QueryRequest(BaseModel):
     query: str
     top_k: Optional[int] = 3
 
+class Citation(BaseModel):
+    drug_id: str
+    smiles: str
+    parent_doc: str
+
 class QueryResponse(BaseModel):
     answer: str
     context: str
     provider: str
+    citations: List[Citation]
+    is_substrate: Optional[str] = None
 
 def bootstrap_efs_from_s3():
     """Background task to sync data from S3."""
@@ -99,7 +106,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="CYP2D6 RAG API", lifespan=lifespan)
 
-def get_rag_context(query_text: str, collection: Any, top_k: int = 3) -> str:
+def get_rag_context(query_text: str, collection: Any, top_k: int = 3) -> dict:
     """Core RAG retrieval logic ported from 04_cli_agent.py"""
     results = collection.query(
         query_texts=[query_text],
@@ -107,7 +114,9 @@ def get_rag_context(query_text: str, collection: Any, top_k: int = 3) -> str:
     )
 
     context_blocks: List[str] = []
+    citations: List[dict] = []
     seen_drugs = set()
+    overall_is_substrate = None
 
     for i in range(len(results['ids'][0])):
         meta = results['metadatas'][0][i]
@@ -120,6 +129,16 @@ def get_rag_context(query_text: str, collection: Any, top_k: int = 3) -> str:
         smiles = str(meta.get('smiles', ''))
         is_substrate = str(meta.get('is_substrate', ''))
         parent_doc = str(meta.get('parent_doc', ''))
+        
+        if overall_is_substrate is None:
+            overall_is_substrate = is_substrate
+
+        citations.append({
+            "drug_id": drug_id,
+            "smiles": smiles,
+            "parent_doc": parent_doc
+        })
+
         ecfp4_preview = (
             str(meta.get('ecfp4', ''))[:30] + '...'
             if meta.get('ecfp4') else ''
@@ -132,7 +151,11 @@ def get_rag_context(query_text: str, collection: Any, top_k: int = 3) -> str:
         block += f"Pharmacology: {parent_doc}\n"
         context_blocks.append(block)
 
-    return "\n".join(context_blocks)
+    return {
+        "context": "\n".join(context_blocks),
+        "citations": citations,
+        "is_substrate": overall_is_substrate
+    }
 
 def query_llm(provider: str, api_key: str, query_text: str, context: str) -> str:
     """Core LLM query logic ported from 04_cli_agent.py"""
@@ -206,7 +229,10 @@ async def run_query(request: QueryRequest):
         raise HTTPException(status_code=500, detail="Vector Database not initialized")
 
     # 1. Retrieval
-    context = get_rag_context(request.query, collection, top_k=request.top_k)
+    rag_data = get_rag_context(request.query, collection, top_k=request.top_k)
+    context = rag_data["context"]
+    citations = rag_data["citations"]
+    is_substrate = rag_data["is_substrate"]
 
     # 2. Preparation for Generation
     provider = os.environ.get("LLM_PROVIDER", "openai").lower()
@@ -219,7 +245,9 @@ async def run_query(request: QueryRequest):
         return QueryResponse(
             answer="[Notice] API Key not found. Running in Retrieval-only mode.",
             context=context,
-            provider="none"
+            provider="none",
+            citations=citations,
+            is_substrate=is_substrate
         )
 
     # 3. Generation
@@ -228,7 +256,9 @@ async def run_query(request: QueryRequest):
     return QueryResponse(
         answer=answer,
         context=context,
-        provider=provider
+        provider=provider,
+        citations=citations,
+        is_substrate=is_substrate
     )
 
 if __name__ == "__main__":
