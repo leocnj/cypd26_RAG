@@ -59,6 +59,10 @@ function App() {
         onSendMessage={handleSendMessage}
         isLoading={isLoading}
       />
+      
+      <footer className="medical-disclaimer">
+        Disclaimer: This is an AI assistant for informational purposes only. Do not use for medical decisions without consulting a professional.
+      </footer>
     </div>
   );
 }

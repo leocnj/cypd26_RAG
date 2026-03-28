@@ -52,9 +52,6 @@ const ChatWindow = ({ messages, onSendMessage, isLoading }) => {
             Send
           </button>
         </form>
-        <div className="medical-disclaimer">
-          Disclaimer: This is an AI assistant for informational purposes only. Do not use for medical decisions without consulting a professional.
-        </div>
       </div>
     </>
   );
