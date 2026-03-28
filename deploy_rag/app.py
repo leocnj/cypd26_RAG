@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 logger.info("Container starting up. Python version: %s", sys.version)
 
 import threading
+import subprocess
 from contextlib import asynccontextmanager
 from typing import Any, List, Optional
 
@@ -23,83 +24,101 @@ except Exception as e:
     logger.error("Failed to import dependencies: %s", str(e))
     raise e
 
+load_dotenv()
+
 # Global variables
-models = {}
+models = {"is_syncing": False}
+
+def get_chroma_collection(path: str):
+    """Helper to initialize ChromaDB client and get the collection."""
+    try:
+        chroma_client = chromadb.PersistentClient(path=path)
+        model_name = "all-MiniLM-L6-v2"
+        emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name)
+        collection = chroma_client.get_collection(name="cyp2d6_knowledge_base", embedding_function=emb_fn)
+        return collection
+    except Exception as e:
+        logger.error(f"Error getting Chroma collection from {path}: {e}")
+        return None
 
 class QueryRequest(BaseModel):
     query: str
     top_k: Optional[int] = 3
 
+class Citation(BaseModel):
+    drug_id: str
+    smiles: str
+    parent_doc: str
+
 class QueryResponse(BaseModel):
     answer: str
     context: str
     provider: str
+    citations: List[Citation]
+    is_substrate: Optional[str] = None
 
 def bootstrap_efs_from_s3():
     """Background task to sync data from S3."""
-    s3_bucket = os.environ.get("MIGRATION_S3_BUCKET")
-    s3_prefix = os.environ.get("MIGRATION_S3_PREFIX", "migration/cyp2d6_knowledge_base")
-    chroma_path = os.environ.get("CHROMA_PATH", "/app/chroma_db")
+    models["is_syncing"] = True
+    try:
+        s3_bucket = os.environ.get("MIGRATION_S3_BUCKET")
+        s3_prefix = os.environ.get("MIGRATION_S3_PREFIX", "migration/cyp2d6_knowledge_base")
+        chroma_path = os.environ.get("CHROMA_PATH", "/app/chroma_db")
 
-    if not s3_bucket:
-        logger.info("No MIGRATION_S3_BUCKET set. Skipping bootstrap.")
-        return
+        if not s3_bucket:
+            logger.info("No MIGRATION_S3_BUCKET set. Skipping bootstrap.")
+            return
 
-    logger.info(f"Background Sync: Checking {chroma_path} for data...")
-    is_empty = not os.path.exists(chroma_path) or not os.listdir(chroma_path)
-    
-    if is_empty:
-        logger.info(f"Syncing from s3://{s3_bucket}/{s3_prefix}...")
-        try:
-            import subprocess
-            os.makedirs(chroma_path, exist_ok=True)
-            cmd = ["aws", "s3", "sync", f"s3://{s3_bucket}/{s3_prefix}", chroma_path]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                logger.info("S3 Sync successful.")
-                # After sync, reload the collection count
-                try:
-                    chroma_client = chromadb.PersistentClient(path=chroma_path)
-                    collection = chroma_client.get_collection(name="cyp2d6_knowledge_base")
-                    models["collection"] = collection
-                    models["count"] = collection.count()
-                    logger.info(f"Refreshed VectorDB with {models['count']} records.")
-                except:
-                    pass
-            else:
-                logger.error(f"S3 Sync failed: {result.stderr}")
-        except Exception as e:
-            logger.error(f"Error during S3 Sync: {str(e)}")
-    else:
-        logger.info(f"Data already present at {chroma_path}.")
+        logger.info(f"Background Sync: Checking {chroma_path} for data...")
+        is_empty = not os.path.exists(chroma_path) or not os.listdir(chroma_path)
+        
+        if is_empty:
+            logger.info(f"Syncing from s3://{s3_bucket}/{s3_prefix}...")
+            try:
+                os.makedirs(chroma_path, exist_ok=True)
+                cmd = ["aws", "s3", "sync", f"s3://{s3_bucket}/{s3_prefix}", chroma_path]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    logger.info("S3 Sync successful.")
+                    # After sync, reload the collection count
+                    collection = get_chroma_collection(chroma_path)
+                    if collection:
+                        models["collection"] = collection
+                        models["count"] = collection.count()
+                        logger.info(f"Refreshed VectorDB with {models['count']} records.")
+                    else:
+                        logger.error("Failed to load collection after S3 Sync.")
+                else:
+                    logger.error(f"S3 Sync failed: {result.stderr}")
+            except Exception as e:
+                logger.error(f"Error during S3 Sync: {str(e)}")
+        else:
+            logger.info(f"Data already present at {chroma_path}.")
+    finally:
+        models["is_syncing"] = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    load_dotenv()
-    
     # 1. Start S3 sync in a SEPARATE THREAD so it doesn't block startup
     threading.Thread(target=bootstrap_efs_from_s3, daemon=True).start()
     
     # 2. Try to initialize existing ChromaDB (if any)
     chroma_path = os.environ.get("CHROMA_PATH", "/app/chroma_db")
     if os.path.exists(chroma_path) and os.listdir(chroma_path):
-        try:
-            chroma_client = chromadb.PersistentClient(path=chroma_path)
-            model_name = "all-MiniLM-L6-v2"
-            emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name)
-            collection = chroma_client.get_collection(name="cyp2d6_knowledge_base", embedding_function=emb_fn)
+        collection = get_chroma_collection(chroma_path)
+        if collection:
             models["collection"] = collection
             models["count"] = collection.count()
             logger.info(f"Initialized with existing data: {models['count']} records.")
-        except Exception as e:
-            logger.warning(f"Initial DB connect failed (might still be syncing): {e}")
+        else:
+            logger.warning(f"Initial DB connect failed for {chroma_path} (might still be syncing).")
 
     yield
     models.clear()
 
 app = FastAPI(title="CYP2D6 RAG API", lifespan=lifespan)
 
-def get_rag_context(query_text: str, collection: Any, top_k: int = 3) -> str:
+def get_rag_context(query_text: str, collection: Any, top_k: int = 3) -> dict:
     """Core RAG retrieval logic ported from 04_cli_agent.py"""
     results = collection.query(
         query_texts=[query_text],
@@ -107,7 +126,9 @@ def get_rag_context(query_text: str, collection: Any, top_k: int = 3) -> str:
     )
 
     context_blocks: List[str] = []
+    citations: List[dict] = []
     seen_drugs = set()
+    overall_is_substrate = None
 
     for i in range(len(results['ids'][0])):
         meta = results['metadatas'][0][i]
@@ -120,6 +141,19 @@ def get_rag_context(query_text: str, collection: Any, top_k: int = 3) -> str:
         smiles = str(meta.get('smiles', ''))
         is_substrate = str(meta.get('is_substrate', ''))
         parent_doc = str(meta.get('parent_doc', ''))
+        
+        # Heuristic: if any result is a substrate, mark overall as substrate
+        if is_substrate == '1':
+            overall_is_substrate = '1'
+        elif overall_is_substrate is None:
+            overall_is_substrate = '0'
+
+        citations.append({
+            "drug_id": drug_id,
+            "smiles": smiles,
+            "parent_doc": parent_doc
+        })
+
         ecfp4_preview = (
             str(meta.get('ecfp4', ''))[:30] + '...'
             if meta.get('ecfp4') else ''
@@ -132,12 +166,15 @@ def get_rag_context(query_text: str, collection: Any, top_k: int = 3) -> str:
         block += f"Pharmacology: {parent_doc}\n"
         context_blocks.append(block)
 
-    return "\n".join(context_blocks)
+    return {
+        "context": "\n".join(context_blocks),
+        "citations": citations,
+        "is_substrate": overall_is_substrate
+    }
 
 def query_llm(provider: str, api_key: str, query_text: str, context: str) -> str:
     """Core LLM query logic ported from 04_cli_agent.py"""
     try:
-        import requests
         prompt_intro = "You are an AI assistant for pharmaceutical drug discovery."
         prompt = f"""{prompt_intro} specializing in CYP2D6.
 Use the following retrieved context to answer the user's question.
@@ -192,21 +229,34 @@ Answer:"""
         return f"Error connecting to LLM: {str(e)}"
 
 @app.get("/health")
-async def health_check():
+def health_check():
+    is_syncing = models.get("is_syncing", False)
+    count = models.get("count", 0)
+    
+    status = "healthy"
+    if is_syncing:
+        status = "initializing"
+    elif count == 0:
+        status = "degraded"
+
     return {
-        "status": "healthy",
-        "vector_db_count": models.get("count", 0),
-        "chroma_path": os.environ.get("CHROMA_PATH", "./chroma_db")
+        "status": status,
+        "vector_db_count": count,
+        "chroma_path": os.environ.get("CHROMA_PATH", "/app/chroma_db"),
+        "is_syncing": is_syncing
     }
 
 @app.post("/query", response_model=QueryResponse)
-async def run_query(request: QueryRequest):
+def run_query(request: QueryRequest):
     collection = models.get("collection")
     if not collection:
         raise HTTPException(status_code=500, detail="Vector Database not initialized")
 
     # 1. Retrieval
-    context = get_rag_context(request.query, collection, top_k=request.top_k)
+    rag_data = get_rag_context(request.query, collection, top_k=request.top_k)
+    context = rag_data["context"]
+    citations = rag_data["citations"]
+    is_substrate = rag_data["is_substrate"]
 
     # 2. Preparation for Generation
     provider = os.environ.get("LLM_PROVIDER", "openai").lower()
@@ -219,7 +269,9 @@ async def run_query(request: QueryRequest):
         return QueryResponse(
             answer="[Notice] API Key not found. Running in Retrieval-only mode.",
             context=context,
-            provider="none"
+            provider="none",
+            citations=citations,
+            is_substrate=is_substrate
         )
 
     # 3. Generation
@@ -228,7 +280,9 @@ async def run_query(request: QueryRequest):
     return QueryResponse(
         answer=answer,
         context=context,
-        provider=provider
+        provider=provider,
+        citations=citations,
+        is_substrate=is_substrate
     )
 
 if __name__ == "__main__":
