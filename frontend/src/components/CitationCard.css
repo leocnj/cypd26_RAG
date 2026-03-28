@@ -1,0 +1,20 @@
+.citation-card {
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 0.5rem;
+  margin-top: 0.5rem;
+  background-color: var(--bg-color);
+  font-size: 0.85rem;
+  word-break: break-all;
+  color: var(--text-main);
+}
+
+.citation-header {
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+  color: var(--primary-color);
+}
+
+.citation-body {
+  color: var(--text-muted);
+}
